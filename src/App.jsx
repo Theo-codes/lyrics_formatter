@@ -1,9 +1,9 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 
-const BLUE       = '#3B82F6'   // buttons
-const BLUE_HOV   = '#2563EB'   // button hover
-const GREY_ACC   = '#4B5563'   // focus rings, spinner, top bar
-const GREY_TOP   = '#1F2937'   // top bar gradient start
+const BLUE       = '#3B82F6'
+const BLUE_HOV   = '#2563EB'
+const GREY_ACC   = '#4B5563'
+const GREY_TOP   = '#1F2937'
 const BORDER     = '#2A2A35'
 const MUTED      = '#6B7280'
 const BG         = '#0F0F12'
@@ -11,25 +11,36 @@ const PANEL      = '#16161B'
 const PANEL_HEAD = '#1C1C24'
 const TEXT       = '#E2DCF0'
 
-// corsproxy.io returns the raw response body directly — faster than allorigins.win
-const PROXY = url => `https://corsproxy.io/?${encodeURIComponent(url)}`
-
 const SOURCE_COLORS = {
   'AZLyrics':   { bg: '#2A1608', text: '#FB923C', border: '#3D1E09' },
   'Genius':     { bg: '#252006', text: '#FACC15', border: '#38300A' },
   'lyrics.ovh': { bg: '#0C1628', text: '#60A5FA', border: '#112040' },
 }
 
-// ── Source: lyrics.ovh (direct API, no proxy — fastest) ────────────────────
+// ── Proxy racing: fire two CORS proxies, use whichever responds first ───────
+
+async function proxyFetch(url) {
+  const ac = [new AbortController(), new AbortController()]
+  const attempt = (make, i) =>
+    fetch(make(url), { signal: ac[i].signal }).then(res => {
+      if (!res.ok) throw new Error(res.status)
+      ac[1 - i].abort()
+      return res
+    })
+  return Promise.any([
+    attempt(u => `https://corsproxy.io/?${encodeURIComponent(u)}`, 0),
+    attempt(u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`, 1),
+  ])
+}
+
+// ── Source: lyrics.ovh (direct — no proxy, fastest) ────────────────────────
 
 async function searchLyricsOvh(query) {
   const res = await fetch(`https://api.lyrics.ovh/suggest/${encodeURIComponent(query)}`)
   if (!res.ok) throw new Error()
   const data = await res.json()
   return (data.data || []).slice(0, 5).map(s => ({
-    title: s.title,
-    artist: s.artist.name,
-    source: 'lyrics.ovh',
+    title: s.title, artist: s.artist.name, source: 'lyrics.ovh',
     fetchLyrics: () => fetchLyricsOvhSong(s.artist.name, s.title),
   }))
 }
@@ -45,11 +56,12 @@ async function fetchLyricsOvhSong(artist, title) {
 }
 
 // ── Source: AZLyrics ───────────────────────────────────────────────────────
+// mode='songs' searches title/artist; mode='lyrics' searches song content
+// Both run in parallel so a lyric line also finds the right song.
 
-async function searchAZLyrics(query) {
-  const url = `https://search.azlyrics.com/search.php?q=${encodeURIComponent(query)}&w=songs`
-  const res = await fetch(PROXY(url))
-  if (!res.ok) throw new Error()
+async function searchAZLyrics(query, mode = 'songs') {
+  const url = `https://search.azlyrics.com/search.php?q=${encodeURIComponent(query)}&w=${mode}`
+  const res = await proxyFetch(url)
   const html = await res.text()
   const doc = new DOMParser().parseFromString(html, 'text/html')
   const results = []
@@ -71,8 +83,7 @@ async function searchAZLyrics(query) {
 }
 
 async function fetchAZLyricsPage(lyricsUrl) {
-  const res = await fetch(PROXY(lyricsUrl))
-  if (!res.ok) throw new Error()
+  const res = await proxyFetch(lyricsUrl)
   const html = await res.text()
   const doc = new DOMParser().parseFromString(html, 'text/html')
   const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_COMMENT)
@@ -90,8 +101,7 @@ async function fetchAZLyricsPage(lyricsUrl) {
 
 async function searchGenius(query) {
   const url = `https://genius.com/api/search/song?q=${encodeURIComponent(query)}&per_page=5`
-  const res = await fetch(PROXY(url))
-  if (!res.ok) throw new Error()
+  const res = await proxyFetch(url)
   const data = await res.json()
   const hits = data?.response?.sections?.[0]?.hits || []
   return hits.slice(0, 5).map(h => ({
@@ -103,8 +113,7 @@ async function searchGenius(query) {
 }
 
 async function fetchGeniusPage(lyricsUrl) {
-  const res = await fetch(PROXY(lyricsUrl))
-  if (!res.ok) throw new Error()
+  const res = await proxyFetch(lyricsUrl)
   const html = await res.text()
   const doc = new DOMParser().parseFromString(html, 'text/html')
   const containers = doc.querySelectorAll('[data-lyrics-container="true"]')
@@ -182,13 +191,31 @@ export default function App() {
   const [raw, setRaw]               = useState('')
   const [fetchingLyrics, setFetchingLyrics] = useState(false)
   const [fetchError, setFetchError] = useState('')
+  const [readySongs, setReadySongs] = useState(new Set()) // keys whose lyrics are prefetched
 
   const [formatted, setFormatted] = useState('')
   const [copied, setCopied]       = useState(false)
 
-  const leftPaneRef = useRef(null)
+  const leftPaneRef  = useRef(null)
+  const prefetchCache = useRef(new Map())  // key → Promise<string | null>
+  const seenKeys     = useRef(new Set())
 
-  // Stream results: each source posts its results as soon as it resolves
+  // Start fetching lyrics as soon as a result appears — by the time the
+  // user moves their cursor to click, it's already in cache.
+  const prefetch = useCallback((result) => {
+    const key = `${result.source}||${result.title}||${result.artist}`
+    if (!prefetchCache.current.has(key)) {
+      const promise = result.fetchLyrics()
+        .then(lyrics => {
+          setReadySongs(prev => new Set([...prev, key]))
+          return lyrics
+        })
+        .catch(() => null)
+      prefetchCache.current.set(key, promise)
+    }
+    return key
+  }, [])
+
   const handleSearch = useCallback(async () => {
     const q = query.trim()
     if (!q) return
@@ -196,44 +223,65 @@ export default function App() {
     setResults([])
     setSearchError('')
     setFetchError('')
+    setReadySongs(new Set())
+    prefetchCache.current.clear()
+    seenKeys.current.clear()
 
     let found = 0
-    const stream = (res) => {
-      if (res.length) {
-        found += res.length
-        setResults(prev => [...prev, ...res])
-      }
+
+    const stream = (incoming) => {
+      // Deduplicate by title+artist across all sources
+      const fresh = incoming.filter(r => {
+        const k = `${r.title.toLowerCase()}|${r.artist.toLowerCase()}`
+        if (seenKeys.current.has(k)) return false
+        seenKeys.current.add(k)
+        return true
+      })
+      if (!fresh.length) return
+      found += fresh.length
+      // Prefetch lyrics immediately for every new result
+      fresh.forEach(r => prefetch(r))
+      setResults(prev => [...prev, ...fresh])
     }
 
+    // Fire all sources simultaneously:
+    // - lyrics.ovh: title/artist (direct, fastest)
+    // - AZLyrics title search
+    // - AZLyrics lyrics/content search ← handles "search by a line"
+    // - Genius
     await Promise.allSettled([
       searchLyricsOvh(q).then(stream).catch(() => {}),
-      searchAZLyrics(q).then(stream).catch(() => {}),
+      searchAZLyrics(q, 'songs').then(stream).catch(() => {}),
+      searchAZLyrics(q, 'lyrics').then(stream).catch(() => {}),
       searchGenius(q).then(stream).catch(() => {}),
     ])
 
     setSearching(false)
-    if (found === 0) setSearchError('No results found. Try a different title or artist.')
-  }, [query])
+    if (found === 0) setSearchError('No results found. Try a different title, artist, or lyric line.')
+  }, [query, prefetch])
 
   const handleKeyDown = useCallback(e => {
     if (e.key === 'Enter') handleSearch()
   }, [handleSearch])
 
   const selectResult = useCallback(async (result) => {
+    const key = prefetch(result) // ensure in cache (should already be running)
     setResults([])
     setFetchingLyrics(true)
     setFetchError('')
     setRaw('')
     setFormatted('')
     try {
-      const lyrics = await result.fetchLyrics()
-      setRaw(lyrics)
-    } catch {
-      setFetchError(`Could not load lyrics from ${result.source}. Try another result.`)
+      const lyrics = await prefetchCache.current.get(key)
+      if (lyrics) {
+        setRaw(lyrics)
+      } else {
+        setFetchError(`Could not load lyrics from ${result.source}. Try another result.`)
+      }
     } finally {
       setFetchingLyrics(false)
     }
-  }, [])
+  }, [prefetch])
 
   const handleFormat = useCallback(() => {
     if (raw.trim()) setFormatted(formatLyrics(raw))
@@ -249,9 +297,11 @@ export default function App() {
   const handleClear = useCallback(() => {
     setQuery(''); setResults([]); setSearchError(''); setFetchError('')
     setRaw(''); setFormatted(''); setCopied(false); setFetchingLyrics(false)
+    setReadySongs(new Set())
+    prefetchCache.current.clear()
+    seenKeys.current.clear()
   }, [])
 
-  // Close dropdown when clicking outside the left pane
   useEffect(() => {
     const handler = e => {
       if (leftPaneRef.current && !leftPaneRef.current.contains(e.target)) {
@@ -268,6 +318,7 @@ export default function App() {
     <div style={{ minHeight: '100vh', backgroundColor: BG, display: 'flex', flexDirection: 'column', fontFamily: "'Geist Variable', system-ui, sans-serif" }}>
       <style>{`
         @keyframes spin-h { to { transform: translateY(-50%) rotate(360deg); } }
+        @keyframes pulse { 0%,100% { opacity:.4 } 50% { opacity:1 } }
         input, textarea { font-family: 'Geist Variable', system-ui, sans-serif; }
         input::placeholder, textarea::placeholder { color: ${MUTED}; }
         input:focus, textarea:focus { outline: none; }
@@ -276,7 +327,6 @@ export default function App() {
         ::-webkit-scrollbar-thumb { background: ${BORDER}; border-radius: 3px; }
       `}</style>
 
-      {/* Top accent gradient */}
       <div style={{ height: 3, background: `linear-gradient(90deg, ${GREY_TOP}, ${GREY_ACC})`, flexShrink: 0 }} />
 
       {/* Header */}
@@ -290,7 +340,7 @@ export default function App() {
             Lyrics Formatter
           </h1>
           <p style={{ fontSize: 12, color: MUTED, margin: '3px 0 0', lineHeight: 1 }}>
-            EasyWorship prep — search, fetch and clean song lyrics
+            EasyWorship prep — search by title, artist, or any lyric line
           </p>
         </div>
         <button onClick={handleClear} style={{
@@ -315,7 +365,7 @@ export default function App() {
             backgroundColor: PANEL, border: `1px solid ${BORDER}`,
             borderRadius: 8, overflow: 'hidden',
           }}>
-            {/* Header row: label + search bar + button */}
+            {/* Header: label + search */}
             <div style={{
               padding: '8px 10px 8px 14px', borderBottom: `1px solid ${BORDER}`,
               backgroundColor: PANEL_HEAD, display: 'flex', alignItems: 'center', gap: 10,
@@ -327,14 +377,13 @@ export default function App() {
                 Raw Input
               </span>
 
-              {/* Search input */}
               <div style={{ flex: 1, position: 'relative' }}>
                 <div style={{ position: 'absolute', left: 9, top: '50%', transform: 'translateY(-50%)' }}>
                   <SearchIcon color={searching ? GREY_ACC : MUTED} />
                 </div>
                 <input
                   type="text"
-                  placeholder="Search song title or artist…"
+                  placeholder="Title, artist, or a line from the song…"
                   value={query}
                   onChange={e => setQuery(e.target.value)}
                   onKeyDown={handleKeyDown}
@@ -357,7 +406,6 @@ export default function App() {
                 )}
               </div>
 
-              {/* Search button */}
               <button
                 onClick={handleSearch}
                 disabled={searching || !query.trim()}
@@ -382,7 +430,7 @@ export default function App() {
               value={raw}
               onChange={e => { setRaw(e.target.value); setFormatted('') }}
               spellCheck={false}
-              placeholder={fetchingLyrics ? 'Fetching lyrics…' : 'Or paste lyrics directly…'}
+              placeholder={fetchingLyrics ? 'Loading lyrics…' : 'Or paste lyrics directly…'}
               disabled={fetchingLyrics}
               style={{
                 flex: 1, resize: 'none', border: 'none', outline: 'none',
@@ -426,19 +474,13 @@ export default function App() {
             </div>
           </div>
 
-          {/* Results dropdown — overlays the textarea, anchored below the header */}
+          {/* Results dropdown */}
           {(results.length > 0 || searchError) && (
             <div style={{
-              position: 'absolute',
-              top: 41, // height of pane header row
-              left: 0, right: 0,
-              zIndex: 50,
-              backgroundColor: PANEL,
-              border: `1px solid ${BORDER}`,
-              borderTop: 'none',
-              borderRadius: '0 0 8px 8px',
-              maxHeight: 280,
-              overflowY: 'auto',
+              position: 'absolute', top: 41, left: 0, right: 0, zIndex: 50,
+              backgroundColor: PANEL, border: `1px solid ${BORDER}`,
+              borderTop: 'none', borderRadius: '0 0 8px 8px',
+              maxHeight: 300, overflowY: 'auto',
               boxShadow: '0 12px 32px rgba(0,0,0,0.5)',
             }}>
               {searchError && (
@@ -448,12 +490,14 @@ export default function App() {
               )}
               {results.map((r, i) => {
                 const sc = SOURCE_COLORS[r.source] || SOURCE_COLORS['lyrics.ovh']
+                const key = `${r.source}||${r.title}||${r.artist}`
+                const isReady = readySongs.has(key)
                 return (
                   <button
                     key={i}
                     onClick={() => selectResult(r)}
                     style={{
-                      display: 'flex', alignItems: 'center', gap: 12,
+                      display: 'flex', alignItems: 'center', gap: 10,
                       width: '100%', textAlign: 'left', padding: '10px 14px',
                       border: 'none',
                       borderBottom: i < results.length - 1 ? `1px solid ${BORDER}` : 'none',
@@ -463,6 +507,13 @@ export default function App() {
                     onMouseEnter={e => e.currentTarget.style.backgroundColor = '#1E1E28'}
                     onMouseLeave={e => e.currentTarget.style.backgroundColor = 'transparent'}
                   >
+                    {/* Ready indicator */}
+                    <div title={isReady ? 'Lyrics ready' : 'Fetching…'} style={{
+                      width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
+                      backgroundColor: isReady ? '#22C55E' : BORDER,
+                      animation: isReady ? 'none' : 'pulse 1.2s ease-in-out infinite',
+                    }} />
+
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 13, fontWeight: 500, color: TEXT, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                         {r.title}
@@ -483,7 +534,7 @@ export default function App() {
           )}
         </div>
 
-        {/* ── Right pane: formatted output ── */}
+        {/* ── Right pane ── */}
         <div style={{
           flex: 1, display: 'flex', flexDirection: 'column',
           backgroundColor: PANEL, border: `1px solid ${BORDER}`,
